@@ -43,14 +43,3 @@ function handleServerEvents(psid) {
     entry.lastSeen = Date.now();
     bumpIdleTimer(psid, entry);
 
-    // ElevenLabs server → client events (subset)
-    // See docs for full list; we handle text + ping. 
-
----
-
-# 5) Make (Streaming back to the user)
-
-- Your **streaming scenario** receives payloads like:
-  ```json
-  { "psid": "12345", "type": "partial", "text": "hello wor", "final": false }
-  { "psid": "12345", "type": "final",   "text": "Hello world!", "final": true }
