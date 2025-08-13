@@ -17,7 +17,7 @@ if (!ELEVEN_KEY || !STREAM_WEBHOOK_URL) {
 }
 
 const IDLE_MS = Number(IDLE_MINUTES) * 60_000;
-const sockets = new Map(); // psid -> { ws, lastSeen, timer, initialized }
+const sockets = new Map(); // psid -> { ws, lastSeen, timer, initialized, hasUserMsg, keepAlive }
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -26,6 +26,7 @@ function bumpIdleTimer(psid, entry) {
   if (entry.timer) clearTimeout(entry.timer);
   entry.timer = setTimeout(() => {
     try { entry.ws.close(1000, "idle-timeout"); } catch {}
+    if (entry.keepAlive) clearInterval(entry.keepAlive);
     sockets.delete(psid);
   }, IDLE_MS);
 }
@@ -45,7 +46,7 @@ function handleServerEvents(psid) {
     entry.lastSeen = Date.now();
     bumpIdleTimer(psid, entry);
 
-    // Ping/pong keepalive
+    // Ping/pong keepalive from ElevenLabs
     if (data.type === "ping" || data.ping_event) {
       try {
         entry.ws.send(JSON.stringify({ type: "pong", event_id: data.ping_event?.event_id }));
@@ -73,7 +74,7 @@ function handleServerEvents(psid) {
   };
 }
 
-// ---- NEW: wait for ws to be OPEN before sending ----
+// Wait for the WS to be OPEN before sending
 function waitForOpen(ws, timeoutMs = 10000) {
   if (ws.readyState === 1) return Promise.resolve(); // OPEN
   return new Promise((resolve, reject) => {
@@ -92,32 +93,50 @@ function waitForOpen(ws, timeoutMs = 10000) {
     const timer = setTimeout(() => { cleanup(); reject(new Error("WS open timeout")); }, timeoutMs);
   });
 }
-// ----------------------------------------------------
+
+// Start client-side keepalive until first real user message
+function startKeepAlive(entry) {
+  if (entry.keepAlive) clearInterval(entry.keepAlive);
+  entry.keepAlive = setInterval(() => {
+    if (entry.ws?.readyState === 1 && !entry.hasUserMsg) {
+      try { entry.ws.send(JSON.stringify({ type: "user_activity" })); } catch {}
+    }
+  }, 15000); // 15s
+}
 
 async function ensureSocket(psid, agentId, pendingInitContext) {
   let entry = sockets.get(psid);
   const open = entry?.ws?.readyState === 1; // OPEN
 
   if (!entry || !open) {
-    const url = `${ELEVEN_WSS}?agent_id=${encodeURIComponent(agentId)}`;
+    // Give more time on idle before ElevenLabs closes the conversation
+    const INACTIVITY_S = 120; // (max ~180)
+    const url = `${ELEVEN_WSS}?agent_id=${encodeURIComponent(agentId)}&inactivity_timeout=${INACTIVITY_S}`;
     const ws = new WebSocket(url, {
       headers: { "xi-api-key": ELEVEN_KEY }
     });
 
-    entry = { ws, lastSeen: Date.now(), timer: null, initialized: false };
+    entry = { ws, lastSeen: Date.now(), timer: null, initialized: false, hasUserMsg: false, keepAlive: null };
     sockets.set(psid, entry);
 
     ws.on("open", () => {
-      // Send init context once (optional), immediately after connect
+      // Optional one-time init payload
       if (pendingInitContext && !entry.initialized) {
         try { ws.send(JSON.stringify(pendingInitContext)); entry.initialized = true; } catch (e) {
           console.error("initContext send error:", e?.message || e);
         }
       }
+      // Keepalive until first user message is sent
+      startKeepAlive(entry);
     });
+
     ws.on("message", handleServerEvents(psid));
-    ws.on("close", () => sockets.delete(psid));
+    ws.on("close", () => {
+      if (entry.keepAlive) clearInterval(entry.keepAlive);
+      sockets.delete(psid);
+    });
     ws.on("error", (e) => {
+      if (entry.keepAlive) clearInterval(entry.keepAlive);
       console.error("ElevenLabs WS error:", e?.message || e);
       sockets.delete(psid);
     });
@@ -144,9 +163,11 @@ app.post("/send", async (req, res) => {
     if (!id) return res.status(400).json({ ok: false, error: "agentId or DEFAULT_AGENT_ID required" });
 
     const ws = await ensureSocket(psid, id, initContext);
+    await waitForOpen(ws, 10000); // ensure OPEN
 
-    // wait until the socket is OPEN before sending
-    await waitForOpen(ws, 10000);
+    // mark that we've now sent a real user message → stop keepalive shortly
+    const entry = sockets.get(psid);
+    if (entry) entry.hasUserMsg = true;
 
     ws.send(JSON.stringify({ type: "user_message", text }));
     return res.json({ ok: true });
