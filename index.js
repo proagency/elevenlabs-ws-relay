@@ -31,7 +31,9 @@ function bumpIdleTimer(psid, entry) {
 }
 
 function forwardToMake(payload) {
-  return axios.post(STREAM_WEBHOOK_URL, payload).catch(() => {});
+  return axios.post(STREAM_WEBHOOK_URL, payload).catch((err) => {
+    console.error("forwardToMake error:", err?.message || err);
+  });
 }
 
 function handleServerEvents(psid) {
@@ -43,31 +45,54 @@ function handleServerEvents(psid) {
     entry.lastSeen = Date.now();
     bumpIdleTimer(psid, entry);
 
-    // ElevenLabs server → client events (subset)
+    // Ping/pong keepalive
     if (data.type === "ping" || data.ping_event) {
-      // Reply with pong; event_id may be present on some ping events
-      entry.ws.send(JSON.stringify({ type: "pong", event_id: data.ping_event?.event_id }));
+      try {
+        entry.ws.send(JSON.stringify({ type: "pong", event_id: data.ping_event?.event_id }));
+      } catch (e) {
+        console.error("pong send error:", e?.message || e);
+      }
       return;
     }
 
-    // Stream tentative (token-y) text
+    // Partial (tentative) text
     if (data.type === "internal_tentative_agent_response") {
       const text = data.tentative_agent_response_internal_event?.tentative_agent_response;
       if (text) await forwardToMake({ psid, type: "partial", text, final: false });
       return;
     }
 
-    // Final agent response
+    // Final text
     if (data.type === "agent_response") {
       const text = data.agent_response_event?.agent_response;
       if (text) await forwardToMake({ psid, type: "final", text, final: true });
       return;
     }
 
-    // (Optional) handle audio chunks if you need TTS streaming
-    // if (data.type === "audio") { ... }
+    // (Optional) audio chunks: if (data.type === "audio") { ... }
   };
 }
+
+// ---- NEW: wait for ws to be OPEN before sending ----
+function waitForOpen(ws, timeoutMs = 10000) {
+  if (ws.readyState === 1) return Promise.resolve(); // OPEN
+  return new Promise((resolve, reject) => {
+    const onOpen = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); reject(new Error("WS closed before open")); };
+    const onError = (err) => { cleanup(); reject(err instanceof Error ? err : new Error(String(err))); };
+    const cleanup = () => {
+      clearTimeout(timer);
+      ws.removeListener("open", onOpen);
+      ws.removeListener("close", onClose);
+      ws.removeListener("error", onError);
+    };
+    ws.on("open", onOpen);
+    ws.on("close", onClose);
+    ws.on("error", onError);
+    const timer = setTimeout(() => { cleanup(); reject(new Error("WS open timeout")); }, timeoutMs);
+  });
+}
+// ----------------------------------------------------
 
 async function ensureSocket(psid, agentId, pendingInitContext) {
   let entry = sockets.get(psid);
@@ -85,16 +110,23 @@ async function ensureSocket(psid, agentId, pendingInitContext) {
     ws.on("open", () => {
       // Send init context once (optional), immediately after connect
       if (pendingInitContext && !entry.initialized) {
-        try { ws.send(JSON.stringify(pendingInitContext)); entry.initialized = true; } catch {}
+        try { ws.send(JSON.stringify(pendingInitContext)); entry.initialized = true; } catch (e) {
+          console.error("initContext send error:", e?.message || e);
+        }
       }
     });
     ws.on("message", handleServerEvents(psid));
     ws.on("close", () => sockets.delete(psid));
-    ws.on("error", () => sockets.delete(psid));
+    ws.on("error", (e) => {
+      console.error("ElevenLabs WS error:", e?.message || e);
+      sockets.delete(psid);
+    });
   } else {
     // If socket exists and we received an init context but never sent it
     if (pendingInitContext && !entry.initialized) {
-      try { entry.ws.send(JSON.stringify(pendingInitContext)); entry.initialized = true; } catch {}
+      try { entry.ws.send(JSON.stringify(pendingInitContext)); entry.initialized = true; } catch (e) {
+        console.error("late initContext send error:", e?.message || e);
+      }
     }
   }
 
@@ -109,16 +141,28 @@ app.post("/send", async (req, res) => {
     if (!psid || !text) return res.status(400).json({ ok: false, error: "psid and text are required" });
 
     const id = agentId || DEFAULT_AGENT_ID;
+    if (!id) return res.status(400).json({ ok: false, error: "agentId or DEFAULT_AGENT_ID required" });
+
     const ws = await ensureSocket(psid, id, initContext);
 
-    // Forward user text to ElevenLabs
+    // wait until the socket is OPEN before sending
+    await waitForOpen(ws, 10000);
+
     ws.send(JSON.stringify({ type: "user_message", text }));
     return res.json({ ok: true });
   } catch (e) {
+    console.error("POST /send error:", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
+// Optional: root alias so POST / also works
+app.post("/", (req, res, next) => {
+  req.url = "/send";
+  next();
+});
+
+app.get("/", (req, res) => res.json({ ok: true, hint: "POST /send with { psid, text }" }));
 app.get("/health", (req, res) => res.json({ ok: true, sockets: sockets.size }));
 app.get("/debug/sockets", (req, res) => {
   const list = [...sockets.entries()].map(([k, v]) => ({ psid: k, lastSeen: v.lastSeen }));
